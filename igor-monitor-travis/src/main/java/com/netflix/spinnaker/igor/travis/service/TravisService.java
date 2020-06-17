@@ -19,6 +19,7 @@ package com.netflix.spinnaker.igor.travis.service;
 
 import static net.logstash.logback.argument.StructuredArguments.kv;
 
+import com.google.common.collect.Lists;
 import com.netflix.spinnaker.fiat.model.resources.Permissions;
 import com.netflix.spinnaker.igor.build.model.GenericBuild;
 import com.netflix.spinnaker.igor.build.model.GenericGitRevision;
@@ -48,10 +49,9 @@ import com.netflix.spinnaker.igor.travis.client.model.v3.TriggerResponse;
 import com.netflix.spinnaker.igor.travis.client.model.v3.V3Build;
 import com.netflix.spinnaker.igor.travis.client.model.v3.V3Builds;
 import com.netflix.spinnaker.igor.travis.client.model.v3.V3Job;
+import com.netflix.spinnaker.igor.travis.client.model.v3.V3Jobs;
 import com.netflix.spinnaker.igor.travis.client.model.v3.V3Log;
-import io.github.resilience4j.circuitbreaker.CircuitBreaker;
 import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;
-import io.github.resilience4j.core.SupplierUtils;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
@@ -63,9 +63,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
-import java.util.function.Supplier;
 import java.util.stream.Collectors;
-import java.util.stream.IntStream;
 import net.logstash.logback.argument.StructuredArguments;
 import org.apache.commons.lang3.StringUtils;
 import org.slf4j.Logger;
@@ -287,32 +285,74 @@ public class TravisService implements BuildOperations, BuildProperties {
         .collect(Collectors.toList());
   }
 
-  private List<V3Job> getJobs(int limit, TravisBuildState... buildStatesFilter) {
-    CircuitBreaker breaker = circuitBreakerRegistry.circuitBreaker("travis");
+  private List<V3Job> getJobs(int numberOfJobs, TravisBuildState... buildStatesFilter) {
+    return getPaginatedJobs(numberOfJobs, buildStatesFilter).stream()
+        .flatMap(v3jobs -> v3jobs.getJobs().stream())
+        .sorted(Comparator.comparing(V3Job::getId))
+        .collect(Collectors.toList());
+  }
 
-    Supplier<List<V3Job>> supplier =
-        SupplierUtils.recover(
-            () ->
-                IntStream.rangeClosed(1, calculatePagination(limit))
-                    .mapToObj(
-                        page ->
-                            travisClient.jobs(
-                                getAccessToken(),
-                                Arrays.stream(buildStatesFilter)
-                                    .map(TravisBuildState::toString)
-                                    .collect(Collectors.joining(",")),
-                                addLogCompleteIfApplicable("job.build"),
-                                getLimit(page, limit),
-                                (page - 1) * TRAVIS_JOB_RESULT_LIMIT))
-                    .flatMap(v3jobs -> v3jobs.getJobs().stream())
-                    .sorted(Comparator.comparing(V3Job::getId))
-                    .collect(Collectors.toList()),
-            error -> {
-              log.warn("An error occurred while fetching new jobs from Travis.", error);
-              return Collections.emptyList();
+  private Collection<V3Jobs> getPaginatedJobs(
+      int numberOfJobs, TravisBuildState... buildStatesFilter) {
+    Collection<V3Jobs> allJobs = Lists.newArrayList();
+    int maxPages = calculatePagination(numberOfJobs);
+    for (int page = 1; page < maxPages; page++) {
+      try {
+        V3Jobs jobs = fetchJobsByPage(page, maxPages, getBuildStates(buildStatesFilter));
+
+        if (jobs.getJobs().isEmpty()) {
+          log.info("No jobs found on page {}/{}. Will skip remaining pages.", page, maxPages);
+          break;
+        }
+
+        allJobs.add(jobs);
+      } catch (RetrofitError e) {
+        if (e.getResponse().getStatus() == 500) {
+          // For some big  orgs Travis returns 500 errors on intermediary pages. However, it
+          // recovers on
+          // further pages.
+          log.info("Skipping jobs for page {}/{} due to error.", page, maxPages);
+          continue;
+        }
+        log.info(
+            "Encountered error while trying to fetch jobs on this page. Will skip remaining.", e);
+        break;
+      } catch (Exception e) {
+        log.info(
+            "Encountered error while trying to fetch jobs on this page. Will skip remaining.", e);
+        break;
+      }
+    }
+
+    return allJobs;
+  }
+
+  private String getBuildStates(TravisBuildState... buildStatesFilter) {
+    return Arrays.stream(buildStatesFilter)
+        .map(TravisBuildState::toString)
+        .collect(Collectors.joining(","));
+  }
+
+  private V3Jobs fetchJobsByPage(int page, int maxPages, String buildStates) throws Exception {
+    return circuitBreakerRegistry
+        .circuitBreaker("travis")
+        .executeCallable(
+            () -> {
+              int limit = getLimit(page, numberOfJobs);
+              int offset = (page - 1) * TRAVIS_JOB_RESULT_LIMIT;
+              log.info(
+                  "Fetching Travis jobs page: {}/{}, limit={}, offset={}",
+                  page,
+                  maxPages,
+                  limit,
+                  offset);
+              return travisClient.jobs(
+                  getAccessToken(),
+                  buildStates,
+                  addLogCompleteIfApplicable("job.build"),
+                  limit,
+                  offset);
             });
-
-    return breaker.executeSupplier(supplier);
   }
 
   public List<V3Build> getLatestBuilds() {
